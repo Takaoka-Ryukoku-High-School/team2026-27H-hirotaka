@@ -1,297 +1,370 @@
+import asyncio
 import json
+import time
+from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 import flet as ft
+from flet_charts import ChartAxis, ChartAxisLabel, LineChart, LineChartData, LineChartDataPoint
+from flet_webview import WebView
 
 
-DATA_FILE = Path.home() / ".daily_note_tasks.json"
-GREEN = "#2E6654"
-GREEN_LIGHT = "#E2EDE5"
-PAPER = "#F6F5EF"
-INK = "#202C2A"
-MUTED = "#77807B"
-CORAL = "#CF6048"
+DATA_FILE = Path.home() / ".stopwatch_history.json"
 
 
-def load_tasks():
+def format_elapsed(total_seconds: float) -> str:
+    total_milliseconds = int(round(total_seconds * 100))
+    centiseconds = total_milliseconds % 100
+    total_seconds_int = total_milliseconds // 100
+    hours, remainder = divmod(total_seconds_int, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def load_history():
     try:
-        tasks = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        if isinstance(tasks, list):
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
             return [
-                task
-                for task in tasks
-                if isinstance(task, dict)
-                and isinstance(task.get("id"), str)
-                and isinstance(task.get("text"), str)
-                and isinstance(task.get("done"), bool)
-            ]
+                item
+                for item in data
+                if isinstance(item, dict)
+                and isinstance(item.get("elapsed"), (int, float))
+                and isinstance(item.get("timestamp"), str)
+                and isinstance(item.get("duration"), str)
+            ][:20]
     except (OSError, json.JSONDecodeError):
         pass
     return []
 
 
-def save_tasks(tasks):
-    DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_history(history):
+    DATA_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def main(page: ft.Page):
-    page.title = "今日の段取り | ToDo"
+def add_history_entry(history, elapsed: float):
+    entry = {
+        "elapsed": round(float(elapsed), 2),
+        "duration": format_elapsed(elapsed),
+        "timestamp": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+    }
+    history.insert(0, entry)
+    history = history[:20]
+    save_history(history)
+    return history
+
+
+def average_history(history):
+    if not history:
+        return 0.0
+    return sum(item.get("elapsed", 0.0) for item in history) / len(history)
+
+
+def clear_history():
+    if DATA_FILE.exists():
+        DATA_FILE.unlink()
+    return []
+
+
+async def main(page: ft.Page):
+    page.title = "Stopwatch"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = PAPER
+    page.bgcolor = "#F5F7F3"
     page.padding = 24
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.scroll = ft.ScrollMode.AUTO
+    page.vertical_alignment = ft.MainAxisAlignment.CENTER
 
-    tasks = load_tasks()
-    current_filter = "all"
+    elapsed = 0.0
+    running = False
+    started_at = 0.0
+    timer_task = None
+    laps = []
+    history = load_history()
 
-    task_input = ft.TextField(
-        hint_text="次にやることは？",
-        expand=True,
-        autofocus=True,
-        border_radius=6,
-        border_color="#D4DED5",
-        focused_border_color=GREEN,
-        bgcolor="#FFFEFA",
-        text_size=15,
-        on_submit=lambda event: add_task(event),
+    display = ft.Text("00:00:00.00", size=58, weight=ft.FontWeight.BOLD, color="#1F2D2A")
+    lap_list = ft.Column(spacing=8, height=140, scroll=ft.ScrollMode.AUTO)
+    history_list = ft.Column(spacing=8, height=150, scroll=ft.ScrollMode.AUTO)
+    summary_text = ft.Text("平均: 0.00秒", size=14, color="#4A6157", max_lines=1)
+    history_chart = LineChart(
+        width=380,
+        height=200,
+        min_x=0,
+        min_y=0,
+        left_axis=ChartAxis(title=ft.Text("秒", rotate=1.5708), label_size=36),
+        bottom_axis=ChartAxis(label_size=28),
+        horizontal_grid_lines=None,
     )
-    task_list = ft.Column(spacing=0)
-    task_count = ft.Text(color=MUTED, size=12)
-    progress_label = ft.Text(color=MUTED, size=11)
-    clear_done_button = ft.TextButton(
-        "完了した項目を削除",
-        icon=ft.Icons.DELETE_OUTLINE,
-        style=ft.ButtonStyle(color=CORAL),
-        on_click=lambda event: clear_done(event),
-    )
-    filter_buttons = {}
 
-    def persist():
-        try:
-            save_tasks(tasks)
-            progress_label.value = f"{sum(task['done'] for task in tasks)} / {len(tasks)} 件 完了"
-        except OSError:
-            progress_label.value = "保存できませんでした。書き込み権限をご確認ください。"
+    def update_display():
+        current_value = elapsed if not running else elapsed + (time.perf_counter() - started_at)
+        display.value = format_elapsed(current_value)
 
-    def set_filter(value):
-        nonlocal current_filter
-        current_filter = value
-        render()
+    async def timer_loop():
+        while running:
+            update_display()
+            page.update()
+            await asyncio.sleep(0.05)
 
-    def add_task(event):
-        text = task_input.value.strip()
-        if not text:
-            return
-        tasks.insert(0, {"id": str(uuid4()), "text": text, "done": False})
-        task_input.value = ""
-        persist()
-        set_filter("all")
+    def start_or_pause(_):
+        nonlocal running, started_at, elapsed, timer_task, history
 
-    def toggle_task(task_id):
-        for task in tasks:
-            if task["id"] == task_id:
-                task["done"] = not task["done"]
-                break
-        persist()
-        render()
+        if running:
+            elapsed += time.perf_counter() - started_at
+            running = False
+            if timer_task is not None:
+                timer_task.cancel()
+                timer_task = None
+            start_button.text = "開始"
+            start_button.icon = ft.Icons.PLAY_ARROW_ROUNDED
+            history = add_history_entry(history, elapsed)
+            elapsed = 0.0
+            render_history()
+        else:
+            running = True
+            started_at = time.perf_counter()
+            timer_task = asyncio.create_task(timer_loop())
+            start_button.text = "一時停止"
+            start_button.icon = ft.Icons.PAUSE_ROUNDED
 
-    def delete_task(task_id):
-        tasks[:] = [task for task in tasks if task["id"] != task_id]
-        persist()
-        render()
-
-    def clear_done(event):
-        tasks[:] = [task for task in tasks if not task["done"]]
-        persist()
-        render()
-
-    def render():
-        visible_tasks = [
-            task
-            for task in tasks
-            if current_filter == "all"
-            or (current_filter == "active" and not task["done"])
-            or (current_filter == "done" and task["done"])
-        ]
-        remaining = sum(not task["done"] for task in tasks)
-        completed = len(tasks) - remaining
-        task_count.value = f"未完了 {remaining} 件"
-        progress_label.value = (
-            f"{completed} / {len(tasks)} 件 完了" if tasks else "タスクはまだありません"
-        )
-        clear_done_button.visible = completed > 0
-
-        for key, button in filter_buttons.items():
-            selected = key == current_filter
-            button.style = ft.ButtonStyle(
-                color=GREEN if selected else MUTED,
-                bgcolor=GREEN_LIGHT if selected else "transparent",
-                shape=ft.RoundedRectangleBorder(radius=4),
-            )
-
-        rows = []
-        for task in visible_tasks:
-            checkbox = ft.Checkbox(
-                value=task["done"],
-                label=task["text"],
-                expand=True,
-                active_color=GREEN,
-                label_style=ft.TextStyle(
-                    color="#929992" if task["done"] else INK,
-                    decoration=ft.TextDecoration.LINE_THROUGH if task["done"] else None,
-                    size=14,
-                ),
-                on_change=lambda event, task_id=task["id"]: toggle_task(task_id),
-            )
-            delete_button = ft.IconButton(
-                icon=ft.Icons.DELETE_OUTLINE,
-                icon_color=MUTED,
-                tooltip=f"「{task['text']}」を削除",
-                on_click=lambda event, task_id=task["id"]: delete_task(task_id),
-            )
-            rows.extend(
-                [
-                    ft.Row([checkbox, delete_button], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    ft.Divider(height=1, thickness=1, color="#DEDFD5"),
-                ]
-            )
-
-        if not visible_tasks:
-            empty_text = (
-                "未完了のタスクはありません。いい調子！"
-                if current_filter == "active" and tasks
-                else "完了したタスクはまだありません。"
-                if current_filter == "done" and tasks
-                else "まずは、やることをひとつ書いてみましょう。"
-            )
-            rows = [
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text("○", size=24, color="#9A7629", text_align=ft.TextAlign.CENTER),
-                            ft.Text(empty_text, size=13, color=MUTED, text_align=ft.TextAlign.CENTER),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=10,
-                    ),
-                    padding=32,
-                    alignment=ft.Alignment.CENTER,
-                )
-            ]
-
-        task_list.controls = rows
+        update_display()
         page.update()
 
-    for key, label in (("all", "すべて"), ("active", "未完了"), ("done", "完了")):
-        filter_buttons[key] = ft.TextButton(
-            label,
-            on_click=lambda event, value=key: set_filter(value),
-        )
+    def add_lap(_):
+        nonlocal laps
+        if not running and elapsed == 0 and not laps:
+            return
 
-    today = ft.Text(
-        __import__("datetime").date.today().strftime("%Y年%m月%d日"),
-        size=12,
-        color=MUTED,
-    )
-    composer = ft.Row(
-        [
-            task_input,
-            ft.Button(
-                "追加  ＋",
-                on_click=add_task,
-                bgcolor=GREEN,
-                color="white",
-                height=48,
-                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=5)),
-            ),
-        ],
-        spacing=10,
-    )
-
-    content = ft.Column(
-        [
+        current = elapsed if not running else elapsed + (time.perf_counter() - started_at)
+        laps.insert(0, {"index": len(laps) + 1, "time": current})
+        lap_entries = [
             ft.Row(
                 [
-                    ft.Row(
-                        [
-                            ft.Container(
-                                content=ft.Text("日", color="white", size=15, weight=ft.FontWeight.BOLD),
-                                width=28,
-                                height=28,
-                                bgcolor=GREEN,
-                                border_radius=14,
-                                alignment=ft.Alignment.CENTER,
-                            ),
-                            ft.Text("DAILY NOTE", size=12, color=GREEN, weight=ft.FontWeight.BOLD),
-                        ],
-                        spacing=10,
-                    ),
-                    today,
+                    ft.Text(f"Lap {lap['index']}", color="#4A6157", weight=ft.FontWeight.W_600),
+                    ft.Text(format_elapsed(lap["time"]), color="#1F2D2A"),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            ),
-            ft.Column(
-                [
-                    ft.Text("今日の段取り", size=38, color=INK, weight=ft.FontWeight.W_600),
-                    ft.Text("ひとつずつ、進めていこう。", size=13, color=MUTED),
+            )
+            for lap in laps
+        ]
+        lap_list.controls = lap_entries
+        page.update()
+
+    def reset_timer(_):
+        nonlocal elapsed, running, started_at, timer_task, laps
+
+        if timer_task is not None:
+            timer_task.cancel()
+            timer_task = None
+
+        running = False
+        elapsed = 0.0
+        started_at = 0.0
+        laps = []
+        lap_list.controls.clear()
+        display.value = "00:00:00.00"
+        start_button.text = "開始"
+        start_button.icon = ft.Icons.PLAY_ARROW_ROUNDED
+        page.update()
+
+    def record_elapsed(_):
+        nonlocal elapsed, started_at, history
+        current = elapsed if not running else elapsed + (time.perf_counter() - started_at)
+        if current <= 0:
+            return
+        history = add_history_entry(history, current)
+        render_history()
+
+    def delete_history_entry(index: int):
+        nonlocal history
+        if 0 <= index < len(history):
+            del history[index]
+            save_history(history)
+            render_history()
+
+    def clear_all_history(_):
+        nonlocal history
+        history = clear_history()
+        render_history()
+
+    def render_history():
+        avg_value = average_history(history)
+        summary_text.value = f"平均: {avg_value:.2f}秒"
+
+        chronological_history = list(reversed(history))
+        history_chart.visible = bool(chronological_history)
+        history_chart.data_series = [
+            LineChartData(
+                color="#3D8B70",
+                stroke_width=3,
+                point=True,
+                points=[
+                    LineChartDataPoint(
+                        x=index,
+                        y=item["elapsed"],
+                        tooltip=f"{item['duration']}\n{item['timestamp']}",
+                    )
+                    for index, item in enumerate(chronological_history, start=1)
                 ],
-                spacing=4,
+            ),
+            LineChartData(
+                color="#CF6048",
+                stroke_width=2,
+                dash_pattern=[6, 4],
+                point=False,
+                points=[
+                    LineChartDataPoint(x=0, y=avg_value),
+                    LineChartDataPoint(
+                        x=max(2, len(chronological_history) + 1),
+                        y=avg_value,
+                    ),
+                ],
+            ),
+        ] if chronological_history else []
+        history_chart.max_x = max(2, len(chronological_history) + 1)
+        history_chart.max_y = max(
+            1,
+            max((item["elapsed"] for item in chronological_history), default=0) * 1.15,
+        )
+        history_chart.bottom_axis = ChartAxis(
+            labels=[
+                ChartAxisLabel(value=index, label=str(index))
+                for index in range(1, len(chronological_history) + 1)
+            ],
+            label_size=28,
+        )
+
+        if not history:
+            history_list.controls = [
+                ft.Text("まだ記録がありません", color="#809188", size=12),
+            ]
+            page.update()
+            return
+
+        history_list.controls = [
+            ft.Row(
+                [
+                    ft.Text(f"{index}.", width=24, color="#4A6157", weight=ft.FontWeight.W_600),
+                    ft.Text(item["duration"], color="#1F2D2A"),
+                    ft.Text(item["timestamp"], color="#809188", size=10),
+                    ft.IconButton(
+                        icon=ft.Icons.DELETE_OUTLINE,
+                        icon_color="#CF6048",
+                        tooltip="削除",
+                        on_click=lambda _, i=index - 1: delete_history_entry(i),
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            )
+            for index, item in enumerate(history, start=1)
+        ]
+        page.update()
+
+    start_button = ft.Button(
+        "開始",
+        icon=ft.Icons.PLAY_ARROW_ROUNDED,
+        on_click=start_or_pause,
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
+    )
+    lap_button = ft.OutlinedButton("ラップ", icon=ft.Icons.TIMER_OUTLINED, on_click=add_lap)
+    record_button = ft.TextButton("記録", icon=ft.Icons.SAVE_ALT_ROUNDED, on_click=record_elapsed)
+    clear_history_button = ft.TextButton("履歴削除", icon=ft.Icons.DELETE_SWEEP_ROUNDED, on_click=clear_all_history)
+    reset_button = ft.Button(
+        "リセット",
+        icon=ft.Icons.RESTART_ALT_ROUNDED,
+        on_click=reset_timer,
+        width=132,
+        style=ft.ButtonStyle(
+            bgcolor="#FCE8E4",
+            color="#A63D2F",
+            shape=ft.RoundedRectangleBorder(radius=12),
+        ),
+    )
+
+    content = ft.ResponsiveRow(
+        controls=[
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text("Stopwatch", size=22, weight=ft.FontWeight.W_600, color="#2D4F45"),
+                        display,
+                        ft.Row(
+                            [
+                                start_button,
+                                lap_button,
+                                record_button,
+                                clear_history_button,
+                                reset_button,
+                            ],
+                            spacing=8,
+                            wrap=True,
+                            run_spacing=8,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                        ),
+                        ft.Container(
+                            content=ft.Column(
+                                [
+                                    ft.Text("Laps", size=16, weight=ft.FontWeight.W_600, color="#2D4F45"),
+                                    lap_list,
+                                ],
+                                spacing=8,
+                            ),
+                            width=420,
+                            bgcolor="#FFFFFF",
+                            border_radius=18,
+                            padding=20,
+                            shadow=ft.BoxShadow(blur_radius=20, color="#D7E0D9", offset=ft.Offset(0, 8)),
+                        ),
+                        ft.Container(
+                            content=ft.Column(
+                                [
+                                    ft.Text("記録履歴", size=16, weight=ft.FontWeight.W_600, color="#2D4F45"),
+                                    ft.Container(content=summary_text, height=28),
+                                    history_chart,
+                                    history_list,
+                                ],
+                                spacing=8,
+                            ),
+                            width=420,
+                            bgcolor="#FFFFFF",
+                            border_radius=18,
+                            padding=20,
+                            shadow=ft.BoxShadow(blur_radius=20, color="#D7E0D9", offset=ft.Offset(0, 8)),
+                        ),
+                    ],
+                    spacing=18,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                col={ft.ResponsiveRowBreakpoint.XS: 12, ft.ResponsiveRowBreakpoint.LG: 6},
             ),
             ft.Container(
                 content=ft.Column(
                     [
-                        ft.Container(content=composer, padding=18, bgcolor=GREEN_LIGHT),
-                        ft.Container(
-                            content=ft.Row(
-                                [ft.Row(list(filter_buttons.values()), spacing=0), task_count],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(bottom=ft.BorderSide(1, "#DEDFD5")),
-                        ),
-                        ft.Container(content=task_list, padding=ft.Padding.symmetric(horizontal=18)),
-                        ft.Container(
-                            content=ft.Row(
-                                [progress_label, clear_done_button],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(top=ft.BorderSide(1, "#DEDFD5")),
-                        ),
+                        ft.Text("音声文字起こし", size=18, weight=ft.FontWeight.W_600, color="#2D4F45"),
+                        WebView(url="/transcriber.html?embed=1", expand=True, height=780),
                     ],
-                    spacing=0,
+                    spacing=12,
+                    expand=True,
                 ),
-                width=700,
-                bgcolor="#FFFEFA",
-                border=ft.Border.all(1, "#E3E3D9"),
-                border_radius=8,
-                shadow=ft.BoxShadow(blur_radius=28, color="#182D2314", offset=ft.Offset(0, 10)),
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                col={ft.ResponsiveRowBreakpoint.XS: 12, ft.ResponsiveRowBreakpoint.LG: 6},
+                height=860,
+                bgcolor="#FFFFFF",
+                border_radius=18,
+                padding=20,
+                shadow=ft.BoxShadow(blur_radius=20, color="#D7E0D9", offset=ft.Offset(0, 8)),
             ),
         ],
-        width=700,
-        spacing=28,
+        columns=12,
+        spacing=20,
+        run_spacing=20,
+        alignment=ft.MainAxisAlignment.CENTER,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+        expand=True,
     )
 
-    app_container = ft.Container(content=content, width=700, padding=ft.Padding.only(top=18, bottom=32))
-    workspace_card = content.controls[2]
-
-    def resize_page(event):
-        viewport_width = page.width or 748
-        page.padding = 12 if viewport_width < 520 else 24
-        content_width = min(700, max(272, viewport_width - page.padding * 2))
-        app_container.width = content_width
-        content.width = content_width
-        workspace_card.width = content_width
-        page.update()
-
-    page.on_resize = resize_page
-    page.add(app_container)
-    render()
+    page.add(content)
+    render_history()
+    update_display()
 
 
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.WEB_BROWSER)
+    ft.run(main, view=ft.AppView.WEB_BROWSER, port=0)
