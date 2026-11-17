@@ -79,6 +79,24 @@
     }
 
     button:disabled { cursor: not-allowed; opacity: 0.48; }
+    #stop {
+      display: block;
+      width: 100%;
+      min-height: 56px;
+      margin: 4px 0 16px;
+      border: 2px solid #e4c9c4;
+      background: #fcf3f1;
+      color: var(--red);
+      font-weight: 600;
+      font-size: 16px;
+      opacity: 1;
+    }
+    #stop:not(:disabled) {
+      border-color: var(--red);
+      background: var(--red);
+      color: white;
+      cursor: pointer;
+    }
     button:focus-visible, a:focus-visible, textarea:focus-visible { outline: 3px solid #78a88e; outline-offset: 2px; }
 
     #status {
@@ -116,6 +134,19 @@
       font-size: 14px;
     }
 
+    #summary {
+      margin: 16px 0 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--green-soft);
+      color: var(--ink);
+      font: inherit;
+      font-size: 15px;
+      line-height: 1.8;
+      white-space: pre-wrap;
+    }
+
     .privacy {
       margin: 14px 0 0;
       color: var(--muted);
@@ -140,17 +171,20 @@
     <section class="panel" aria-label="音声文字起こし">
       <div class="toolbar">
         <button id="start" class="primary" type="button">録音を開始</button>
-        <button id="stop" type="button" disabled>録音停止</button>
         <span id="status" role="status" aria-live="polite">待機中</span>
       </div>
+      <button id="stop" type="button" disabled>録音停止</button>
       <textarea id="transcript" aria-label="文字起こし結果" placeholder="認識したテキストがここに表示されます"></textarea>
       <audio id="playback" controls hidden aria-label="録音の再生"></audio>
       <a id="download" hidden>録音をダウンロード</a>
       <div class="toolbar" style="margin: 12px 0 0">
         <button id="copy" type="button">コピー</button>
-        <button id="clear" type="button">クリア</button>
+        <button id="clear" type="button" aria-label="文字起こしと要約を消去">文字起こしを消去</button>
+        <button id="summarize" class="primary" type="button">AIで要約</button>
       </div>
-      <p class="privacy">録音はこのページ内で保持し、停止後に再生・ダウンロードできます。文字起こしにはブラウザーの音声認識を使うため、音声がブラウザー提供元のサービスへ送信される場合があります。</p>
+      <p id="summary-status" class="privacy" role="status" aria-live="polite"></p>
+      <pre id="summary" hidden aria-label="AI要約結果"></pre>
+      <p class="privacy">録音停止後、音声をGoogle Geminiへ送信して高精度な文字起こしを行います。AI要約では文字起こしテキストもGoogleへ送信されます。録音は停止後に再生・ダウンロードできます。</p>
     </section>
   </main>
   <script>
@@ -161,6 +195,9 @@
     const transcript = document.getElementById("transcript");
     const playback = document.getElementById("playback");
     const downloadLink = document.getElementById("download");
+    const summarizeButton = document.getElementById("summarize");
+    const summaryStatus = document.getElementById("summary-status");
+    const summaryOutput = document.getElementById("summary");
     if (new URLSearchParams(window.location.search).get("embed") === "1") {
       document.querySelector("header a").hidden = true;
     }
@@ -171,12 +208,28 @@
     let recordedChunks = [];
     let recording = false;
     let stopping = false;
+    let recognitionActive = false;
+    let recognitionStarting = false;
+    let recognitionError = "";
     let finalText = "";
 
     function setRecording(value) {
       recording = value;
       startButton.disabled = value || stopping || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder;
       stopButton.disabled = !value;
+    }
+
+    function startRecognition() {
+      if (!recognition || recognitionActive || recognitionStarting) return;
+      try {
+        recognitionError = "";
+        recognitionStarting = true;
+        recognition.start();
+      } catch (error) {
+        recognitionStarting = false;
+        recognitionError = error.name || "start-failed";
+        status.textContent = `音声認識を開始できません: ${recognitionError}`;
+      }
     }
 
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
@@ -189,6 +242,12 @@
       recognition.lang = "ja-JP";
       recognition.continuous = true;
       recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        recognitionStarting = false;
+        recognitionActive = true;
+        if (recording) status.textContent = "録音・文字起こし中...";
+      };
 
       recognition.onresult = (event) => {
         let interimText = "";
@@ -204,19 +263,16 @@
       };
 
       recognition.onerror = (event) => {
+        recognitionError = event.error;
         status.textContent = event.error === "not-allowed"
           ? "マイクの使用が許可されていません"
           : `音声認識エラー: ${event.error}`;
       };
 
       recognition.onend = () => {
-        if (recording) {
-          try {
-            recognition.start();
-          } catch (_) {
-            status.textContent = "音声認識を再開できません。録音は継続中です";
-          }
-        }
+        recognitionActive = false;
+        recognitionStarting = false;
+        if (recording) startRecognition();
       };
     } else if (navigator.mediaDevices?.getUserMedia && window.MediaRecorder) {
       status.textContent = "録音できますが、このブラウザーは音声認識に対応していません";
@@ -224,8 +280,13 @@
 
     startButton.addEventListener("click", async () => {
       if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return;
+      finalText = transcript.value.trim();
+      if (finalText) finalText += "\n";
+      recognitionError = "";
       try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mediaStreamRequest = navigator.mediaDevices.getUserMedia({ audio: true });
+        if (recognition) startRecognition();
+        mediaStream = await mediaStreamRequest;
         recordedChunks = [];
         const recorder = new MediaRecorder(mediaStream);
         mediaRecorder = recorder;
@@ -245,26 +306,30 @@
           mediaStream = null;
           stopping = false;
           setRecording(false);
-          status.textContent = "録音を再生・ダウンロードできます";
+          status.textContent = "録音を保存しました。Geminiで音声を確認しています...";
+          transcribeAudio(blob);
         });
         recorder.start();
-        finalText = transcript.value.trim();
-        if (finalText) finalText += "\n";
-        if (recognition) {
-          try {
-            recognition.start();
-          } catch (_) {
-            status.textContent = "録音中（音声認識を開始できません）";
-          }
-        }
         setRecording(true);
         if (!recognition) status.textContent = "録音中（このブラウザーは音声認識に非対応）";
-        else if (status.textContent === "待機中" || status.textContent === "録音を再生・ダウンロードできます") {
+        else if (recognitionError) {
+          status.textContent = `録音中（音声認識エラー: ${recognitionError}）`;
+          if (!recognitionActive && !recognitionStarting) startRecognition();
+        } else {
+          if (!recognitionActive && !recognitionStarting) startRecognition();
           status.textContent = "録音・文字起こし中...";
         }
       } catch (error) {
         if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
         mediaStream = null;
+        if (recognitionActive || recognitionStarting) {
+          try {
+            recognition.stop();
+          } catch (_) {
+            recognitionActive = false;
+            recognitionStarting = false;
+          }
+        }
         stopping = false;
         setRecording(false);
         status.textContent = error.name === "NotAllowedError"
@@ -293,6 +358,23 @@
       status.textContent = "録音を保存中...";
     });
 
+    async function transcribeAudio(blob) {
+      try {
+        const response = await fetch("/api/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": blob.type.split(";")[0] || "audio/webm" },
+          body: blob,
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "AI文字起こしに失敗しました");
+        finalText = result.transcript;
+        transcript.value = result.transcript;
+        status.textContent = "Geminiによる高精度な文字起こしが完了しました";
+      } catch (error) {
+        status.textContent = `AI文字起こしができませんでした。ブラウザーの認識結果を表示しています: ${error.message}`;
+      }
+    }
+
     document.getElementById("copy").addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText(transcript.value);
@@ -305,6 +387,37 @@
     document.getElementById("clear").addEventListener("click", () => {
       finalText = "";
       transcript.value = "";
+      summaryOutput.textContent = "";
+      summaryOutput.hidden = true;
+      summaryStatus.textContent = "";
+    });
+
+    summarizeButton.addEventListener("click", async () => {
+      const text = transcript.value.trim();
+      if (!text) {
+        summaryStatus.textContent = "先に文字起こしするか、文章を入力してください";
+        return;
+      }
+
+      summarizeButton.disabled = true;
+      summaryStatus.textContent = "要約を作成しています...";
+      summaryOutput.hidden = true;
+      try {
+        const response = await fetch("/api/summarize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "要約に失敗しました");
+        summaryOutput.textContent = result.summary;
+        summaryOutput.hidden = false;
+        summaryStatus.textContent = "要約ができました";
+      } catch (error) {
+        summaryStatus.textContent = error.message || "要約に失敗しました";
+      } finally {
+        summarizeButton.disabled = false;
+      }
     });
   </script>
 </body>
